@@ -1,0 +1,59 @@
+name: Build Unsigned iOS IPA
+
+on:
+  workflow_dispatch:   # 只允许手动触发
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: apps/mobile
+        run: xcodegen generate
+
+      - name: Build (no signing)
+        working-directory: apps/mobile
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project ChinaTextbookStudy.xcodeproj \
+            -scheme ChinaTextbookStudy \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package IPA
+        working-directory: apps/mobile
+        run: |
+          APP_PATH=$(find build/DerivedData -name "ChinaTextbookStudy.app" -type d | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "找不到 .app"
+            find build/DerivedData -name "*.app" -type d || true
+            exit 1
+          fi
+          echo "找到: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry ChinaTextbookStudy-unsigned.ipa Payload
+          ls -lh ChinaTextbookStudy-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChinaTextbookStudy-unsigned-ipa
+          path: apps/mobile/ChinaTextbookStudy-unsigned.ipa
+          retention-days: 14
