@@ -117,13 +117,6 @@ final class AssetDownloader: ObservableObject {
     // MARK: - Per-book download
 
     /// 这本书是不是**真的**下好了 —— 数据包 + 音频包都得在。
-    ///
-    /// 以前只看 `outline.json`,于是「数据包下好了、音频包失败/被清掉」的书照样
-    /// 显示「已下载」:课文页点「朗读全文」毫无反应,听读完成门槛永远解不开,
-    /// 用户也找不到重新下载的入口(iosretention-6)。
-    ///
-    /// 注意 `SeedInstaller` 升级时会整体删掉 `cstf/audio/` —— 标记就放在音频树
-    /// 里面,跟着一起消失,状态自动回落到「需下载」,不会出现「显示已下载但没声音」。
     func isBookDownloaded(_ bookId: String) -> Bool {
         hasBookData(bookId) && hasBookAudio(bookId)
     }
@@ -161,10 +154,6 @@ final class AssetDownloader: ObservableObject {
     }
 
     /// 抽样探测:从这本书的数据里取前几条音频引用,看文件在不在。
-    ///
-    /// - 一条音频引用都没有(纯数学书之类)→ 视为不需要音频,返回 true;
-    /// - 抽到的引用全部命中 → true;任何一条缺失 → false(重下是幂等的,
-    ///   宁可多提示一次,也不要让用户对着没声音的课文干瞪眼)。
     private func probeBookAudio(_ bookId: String) -> Bool {
         let refs = sampleAudioRefs(bookId, limit: 8)
         guard !refs.isEmpty else { return true }
@@ -217,11 +206,8 @@ final class AssetDownloader: ObservableObject {
         return try? DataLoader.shared.loadLesson(bookId: bookId, lessonId: lessonId)
     }
 
-    /// Download both bundles for a book sequentially. Idempotent — if the
-    /// data already exists and SHA matches, the download is skipped.
-    ///
-    /// 音频包**解压成功之后**才写 per-book 落地标记(iosretention-6):数据包成功、
-    /// 音频包失败时这本书不会假装「已下载」,下载卡照样给重试入口。
+    /// Download both bundles for a book sequentially.
+    /// 音频包**解压成功之后**才写 per-book 落地标记。
     func ensureBookDownloaded(_ entry: ManifestEntry) async throws {
         if inFlight.contains(entry.bookId) { return }
         inFlight.insert(entry.bookId)
@@ -256,7 +242,7 @@ final class AssetDownloader: ObservableObject {
         }
     }
 
-    /// Stream-download a zip with progress, verify SHA-256, then unzip in place.
+    /// Stream-download a zip with progress, verify SHA-256, then unzip with overwrite.
     private func downloadBundle(
         bundle: ManifestBundle,
         extractTo destination: URL,
@@ -285,56 +271,63 @@ final class AssetDownloader: ObservableObject {
 
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
 
-// 先尝试删除可能冲突的旧文件，避免「已存在同名文件」错误
-// 数据包会解压出 books/<bookId>/，音频包会解压出 audio/
-if bundle.name.hasPrefix("data-") {
-    // 数据包：只清这本书的目录
-    let bookDir = destination
-        .appendingPathComponent("books", isDirectory: true)
-        .appendingPathComponent(bookId, isDirectory: true)
-    try? FileManager.default.removeItem(at: bookDir)
-} else if bundle.name.hasPrefix("audio-ios-") || bundle.name.hasPrefix("audio-") {
-    // 音频包是内容寻址的，通常不会整目录冲突，但为了保险也清一下临时残留
-    // 这里不做整目录删除，避免影响其他已下载的书
-}
+        // 数据包：先删掉这本书的旧目录，避免冲突
+        if bundle.name.hasPrefix("data-") {
+            let bookDir = destination
+                .appendingPathComponent("books", isDirectory: true)
+                .appendingPathComponent(bookId, isDirectory: true)
+            try? FileManager.default.removeItem(at: bookDir)
+        }
 
-do {
-    // 使用 overwrite 兼容写法（ZIPFoundation 不同版本参数略有差异）
-    try FileManager.default.unzipItem(
-        at: tempURL,
-        to: destination,
-        skipCRC32: false,
-        progress: nil,
-        preferredEncoding: .utf8
-    )
-} catch {
-    // 如果还是失败，再强制清一次后重试一次
-    if bundle.name.hasPrefix("data-") {
-        let bookDir = destination
-            .appendingPathComponent("books", isDirectory: true)
-            .appendingPathComponent(bookId, isDirectory: true)
-        try? FileManager.default.removeItem(at: bookDir)
+        // 关键修复：先解压到临时目录，再覆盖合并到目标目录
+        // 这样音频包里已存在的同名文件也会被正确覆盖，不会报「已存在同名文件」
+        let tempExtractDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cstf-unzip-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempExtractDir) }
+
+        do {
+            try FileManager.default.createDirectory(at: tempExtractDir, withIntermediateDirectories: true)
+            try FileManager.default.unzipItem(at: tempURL, to: tempExtractDir)
+
+            // 把临时目录里的内容覆盖合并到正式 destination
+            try mergeDirectory(from: tempExtractDir, to: destination)
+        } catch {
+            throw AssetDownloadError.unzipFailed(String(describing: error))
+        }
+
+        try? FileManager.default.removeItem(at: tempURL)
     }
-    do {
-        try FileManager.default.unzipItem(at: tempURL, to: destination)
-    } catch {
-        throw AssetDownloadError.unzipFailed(String(describing: error))
-    }
-}
-try? FileManager.default.removeItem(at: tempURL)
+
+    /// 递归把 source 目录的内容覆盖合并到 destination（已存在的文件会被覆盖）
+    private func mergeDirectory(from source: URL, to destination: URL) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+
+        let items = try fm.contentsOfDirectory(
+            at: source,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: []
+        )
+        for item in items {
+            let destItem = destination.appendingPathComponent(item.lastPathComponent)
+            var isDir: ObjCBool = false
+            if fm.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
+                // 子目录：递归合并
+                try mergeDirectory(from: item, to: destItem)
+            } else {
+                // 文件：先删旧的再复制（实现覆盖）
+                if fm.fileExists(atPath: destItem.path) {
+                    try fm.removeItem(at: destItem)
+                }
+                try fm.copyItem(at: item, to: destItem)
+            }
+        }
     }
 
     // MARK: - Story illustrations (content-8)
 
     /// Resolve a story illustration to the locally extracted file, or nil
     /// when the file is missing (callers degrade to a placeholder block).
-    ///
-    /// The data zip built by `scripts/package-release-ios.sh` carries the
-    /// book's illustrations at `story-images/<bookId>/<storyId>.jpg`, which
-    /// unzips next to `books/` under `Application Support/cstf/data/`.
-    /// `imagePath` is the web-style path from `Story.image`
-    /// (e.g. "/story-images/<bookId>/<storyId>.jpg"); when absent we fall
-    /// back to the conventional location.
     nonisolated static func storyImageURL(bookId: String, storyId: String, imagePath: String? = nil) -> URL? {
         let root = DataLoader.shared.sandboxDataRoot
         var candidates: [URL] = []
