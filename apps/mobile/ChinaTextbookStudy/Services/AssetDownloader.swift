@@ -4,24 +4,20 @@ import ZIPFoundation
 
 // MARK: - Manifest models
 
-/// Per-bundle metadata (data zip OR audio zip).
 struct ManifestBundle: Codable, Hashable {
     let name: String
     let bytes: Int64
     let sha256: String
 }
 
-/// One entry per book in `ios-manifest.json`.
 struct ManifestEntry: Codable, Hashable, Identifiable {
     let bookId: String
     let audioRefCount: Int
     let data: ManifestBundle
     let audio: ManifestBundle
-
     var id: String { bookId }
 }
 
-/// Top-level shape produced by `scripts/package-release-ios.sh`.
 struct IosManifest: Codable, Hashable {
     let generatedAt: String
     let aacBitrate: String
@@ -35,6 +31,7 @@ enum AssetDownloadError: Error, LocalizedError {
     case sha256Mismatch(expected: String, actual: String, file: String)
     case unzipFailed(String)
     case httpStatus(Int)
+    case audioNotReady
 
     var errorDescription: String? {
         switch self {
@@ -46,24 +43,22 @@ enum AssetDownloadError: Error, LocalizedError {
             return "解压失败：\(msg)"
         case .httpStatus(let code):
             return "下载失败 HTTP \(code)"
+        case .audioNotReady:
+            return "音频未正确解压到播放目录，请重试下载"
         }
     }
 }
 
 // MARK: - Downloader
 
-/// Downloads + verifies + unzips the per-book release bundles produced by
-/// `scripts/package-release-ios.sh`. State machine is observable so SwiftUI
-/// can drive a progress UI without polling.
 @MainActor
 final class AssetDownloader: ObservableObject {
     static let shared = AssetDownloader()
 
-    /// GitHub Release base URL. Update this when cutting a new iOS asset tag.
     var releaseBaseURL = URL(string: "https://github.com/wuwangzhang1216/ChinaTextbookStudyFree/releases/download/v1.7.3-ios-resources")!
 
     @Published private(set) var manifest: IosManifest?
-    @Published private(set) var bookProgress: [String: Double] = [:]   // bookId → 0...1
+    @Published private(set) var bookProgress: [String: Double] = [:]
     @Published private(set) var inFlight: Set<String> = []
     @Published private(set) var lastError: String?
 
@@ -77,7 +72,6 @@ final class AssetDownloader: ObservableObject {
 
     private var dataRoot: URL { DataLoader.shared.sandboxDataRoot }
     private var audioRoot: URL { DataLoader.shared.sandboxAudioRoot }
-
     private var audioReadyCache: [String: Bool] = [:]
 
     // MARK: - Manifest
@@ -93,6 +87,7 @@ final class AssetDownloader: ObservableObject {
         try? FileManager.default.createDirectory(at: cacheRoot, withIntermediateDirectories: true)
         try? data.write(to: cacheRoot.appendingPathComponent("ios-manifest.json"))
         self.manifest = manifest
+        audioReadyCache.removeAll()
         return manifest
     }
 
@@ -102,11 +97,19 @@ final class AssetDownloader: ObservableObject {
               let m = try? JSONDecoder().decode(IosManifest.self, from: data) else {
             return nil
         }
+        for entry in m.books where hasBookData(entry.bookId) {
+            let marker = audioMarkerURL(entry.bookId)
+            if let old = try? String(contentsOf: marker, encoding: .utf8),
+               old.trimmingCharacters(in: .whitespacesAndNewlines) == entry.audio.sha256 {
+                try? Self.bundleFingerprint(entry).write(to: marker, atomically: true, encoding: .utf8)
+            }
+        }
         self.manifest = m
+        audioReadyCache.removeAll()
         return m
     }
 
-    // MARK: - Per-book download status
+    // MARK: - Status
 
     func isBookDownloaded(_ bookId: String) -> Bool {
         hasBookData(bookId) && hasBookAudio(bookId)
@@ -120,22 +123,25 @@ final class AssetDownloader: ObservableObject {
         return FileManager.default.fileExists(atPath: outline.path)
     }
 
-    /// 即使有 marker，也必须抽查真实文件是否存在。
-    /// 否则会出现「显示已下载但没声音」。
     func hasBookAudio(_ bookId: String) -> Bool {
         if let cached = audioReadyCache[bookId] { return cached }
 
-        let hasMarker = FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path)
+        // 无音频引用的书（部分数学书）直接视为音频就绪
+        if let entry = manifest?.books.first(where: { $0.bookId == bookId }),
+           entry.audioRefCount == 0 || entry.audio.bytes <= 0 || entry.audio.sha256.isEmpty {
+            audioReadyCache[bookId] = true
+            return true
+        }
+
         let filesOk = probeBookAudio(bookId)
+        let hasMarker = FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path)
 
         if hasMarker && !filesOk {
-            // marker 是脏的：清掉，强制下次重新下载
             try? FileManager.default.removeItem(at: audioMarkerURL(bookId))
         }
 
-        let ok = filesOk
-        audioReadyCache[bookId] = ok
-        return ok
+        audioReadyCache[bookId] = filesOk
+        return filesOk
     }
 
     private var audioMarkerDir: URL {
@@ -146,9 +152,13 @@ final class AssetDownloader: ObservableObject {
         audioMarkerDir.appendingPathComponent(bookId)
     }
 
-    private func writeAudioMarker(_ bookId: String, sha: String) {
+    nonisolated static func bundleFingerprint(_ entry: ManifestEntry) -> String {
+        "\(entry.data.sha256)\n\(entry.audio.sha256)"
+    }
+
+    private func writeAudioMarker(_ entry: ManifestEntry) {
         try? FileManager.default.createDirectory(at: audioMarkerDir, withIntermediateDirectories: true)
-        try? sha.write(to: audioMarkerURL(bookId), atomically: true, encoding: .utf8)
+        try? Self.bundleFingerprint(entry).write(to: audioMarkerURL(entry.bookId), atomically: true, encoding: .utf8)
     }
 
     private func probeBookAudio(_ bookId: String) -> Bool {
@@ -163,7 +173,6 @@ final class AssetDownloader: ObservableObject {
             guard refs.count < limit, let path, !path.isEmpty else { return }
             refs.append(path)
         }
-
         if let passages = (try? DataLoader.shared.loadPassages(bookId: bookId))?.passages {
             outer: for p in passages {
                 for s in p.sentences {
@@ -212,32 +221,38 @@ final class AssetDownloader: ObservableObject {
         audioReadyCache.removeAll()
 
         do {
-            // 数据包：0 → 0.2
+            // 数据包 0 → 0.2
             try await downloadBundle(
                 bundle: entry.data,
                 extractTo: dataRoot,
                 weight: 0.2,
+                phaseBase: 0.0,
                 bookId: entry.bookId
             )
             bookProgress[entry.bookId] = 0.2
 
-            // 音频包：0.2 → 1.0
-            try await downloadBundle(
-                bundle: entry.audio,
-                extractTo: audioRoot.deletingLastPathComponent(),
-                weight: 0.8,
-                bookId: entry.bookId
-            )
+            // 无音频的书直接跳过音频下载
+            let needAudio = entry.audioRefCount > 0
+                && entry.audio.bytes > 0
+                && !entry.audio.sha256.isEmpty
 
-            // 只有真实文件探测通过才写 marker
-            audioReadyCache.removeAll()
-            guard probeBookAudio(entry.bookId) else {
-                throw AssetDownloadError.unzipFailed("音频文件未正确解压到播放目录，请重试下载")
+            if needAudio {
+                try await downloadBundle(
+                    bundle: entry.audio,
+                    extractTo: audioRoot.deletingLastPathComponent(),
+                    weight: 0.8,
+                    phaseBase: 0.2,
+                    bookId: entry.bookId
+                )
+                audioReadyCache.removeAll()
+                if !probeBookAudio(entry.bookId) {
+                    throw AssetDownloadError.audioNotReady
+                }
             }
-            writeAudioMarker(entry.bookId, sha: entry.audio.sha256)
+
+            writeAudioMarker(entry)
             audioReadyCache.removeAll()
             bookProgress[entry.bookId] = 1
-
             try? markExcludedFromBackup(dataRoot)
             try? markExcludedFromBackup(audioRoot)
         } catch {
@@ -247,17 +262,14 @@ final class AssetDownloader: ObservableObject {
         }
     }
 
-    /// Stream-download a zip with progress, verify SHA-256, then unzip with overwrite.
     private func downloadBundle(
         bundle: ManifestBundle,
         extractTo destination: URL,
         weight: Double,
+        phaseBase: Double,
         bookId: String
     ) async throws {
         let url = releaseBaseURL.appendingPathComponent(bundle.name)
-
-        // 分段进度基准：数据包从 0 开始，音频包从 0.2 开始
-        let phaseBase = weight <= 0.25 ? 0.0 : 0.2
 
         let (tempURL, resp) = try await session.download(from: url) { [weak self] received, expected in
             guard let self else { return }
@@ -278,56 +290,57 @@ final class AssetDownloader: ObservableObject {
         }
 
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-
-        // 数据包：先删掉这本书的旧目录，避免冲突
-        if bundle.name.hasPrefix("data-") {
-            let bookDir = destination
-                .appendingPathComponent("books", isDirectory: true)
-                .appendingPathComponent(bookId, isDirectory: true)
-            try? FileManager.default.removeItem(at: bookDir)
-        }
-
-        // 先解压到临时目录，再覆盖合并到目标目录
-        let tempExtractDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("cstf-unzip-\(UUID().uuidString)", isDirectory: true)
-        defer { try? FileManager.default.removeItem(at: tempExtractDir) }
-
         do {
-            try FileManager.default.createDirectory(at: tempExtractDir, withIntermediateDirectories: true)
-            try FileManager.default.unzipItem(at: tempURL, to: tempExtractDir)
-            try mergeDirectory(from: tempExtractDir, to: destination)
+            try Self.installArchive(tempURL, destination: destination)
         } catch {
             throw AssetDownloadError.unzipFailed(String(describing: error))
         }
-
         try? FileManager.default.removeItem(at: tempURL)
     }
 
-    /// 递归把 source 目录的内容覆盖合并到 destination（已存在的文件会被覆盖）
-    private func mergeDirectory(from source: URL, to destination: URL) throws {
+    /// 先解压到空临时目录，再逐文件原子写入目标（可覆盖已存在文件）
+    nonisolated static func installArchive(_ archive: URL, destination: URL) throws {
         let fm = FileManager.default
-        try fm.createDirectory(at: destination, withIntermediateDirectories: true)
+        let staging = fm.temporaryDirectory.appendingPathComponent("cstf-install-\(UUID().uuidString)")
+        try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: staging) }
 
-        let items = try fm.contentsOfDirectory(
-            at: source,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: []
-        )
-        for item in items {
-            let destItem = destination.appendingPathComponent(item.lastPathComponent)
-            var isDir: ObjCBool = false
-            if fm.fileExists(atPath: item.path, isDirectory: &isDir), isDir.boolValue {
-                try mergeDirectory(from: item, to: destItem)
-            } else {
-                if fm.fileExists(atPath: destItem.path) {
-                    try fm.removeItem(at: destItem)
-                }
-                try fm.copyItem(at: item, to: destItem)
+        try fm.unzipItem(at: archive, to: staging)
+
+        guard let entries = fm.enumerator(
+            at: staging,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        ) else {
+            throw AssetDownloadError.unzipFailed("无法读取解压资源")
+        }
+
+        var files: [(URL, URL)] = []
+        let stagingPath = staging.standardizedFileURL.path
+        for case let source as URL in entries {
+            let attributes = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if attributes.isSymbolicLink == true {
+                throw AssetDownloadError.unzipFailed("资源包含符号链接")
+            }
+            guard attributes.isRegularFile == true else { continue }
+
+            let sourcePath = source.standardizedFileURL.path
+            guard sourcePath.hasPrefix(stagingPath) else { continue }
+            var relative = String(sourcePath.dropFirst(stagingPath.count))
+            if relative.hasPrefix("/") { relative.removeFirst() }
+            guard !relative.isEmpty else { continue }
+            files.append((source, destination.appendingPathComponent(relative)))
+        }
+
+        for (source, target) in files {
+            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try Data(contentsOf: source)
+            if (try? Data(contentsOf: target)) != data {
+                try data.write(to: target, options: .atomic)
             }
         }
     }
 
-    // MARK: - Story illustrations
+    // MARK: - Story images
 
     nonisolated static func storyImageURL(bookId: String, storyId: String, imagePath: String? = nil) -> URL? {
         let root = DataLoader.shared.sandboxDataRoot
@@ -372,7 +385,7 @@ final class AssetDownloader: ObservableObject {
     }
 }
 
-// MARK: - URLSession async download with progress
+// MARK: - URLSession progress download
 
 private extension URLSession {
     func download(
