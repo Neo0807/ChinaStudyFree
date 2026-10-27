@@ -1,25 +1,46 @@
 name: Build Unsigned iOS IPA
 
 on:
-  workflow_dispatch:   # 只允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-14
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          # 优先用较新的 Xcode
+          ls /Applications/ | grep Xcode
+          sudo xcode-select -s /Applications/Xcode_16.1.app || \
+          sudo xcode-select -s /Applications/Xcode_16.app || \
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Generate Xcode project
         working-directory: apps/mobile
-        run: xcodegen generate
+        run: |
+          xcodegen generate
+          ls -la
+          # 确认生成了工程
+          test -d ChinaTextbookStudy.xcodeproj
 
-      - name: Build (no signing)
+      - name: Resolve Swift Packages
+        working-directory: apps/mobile
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project ChinaTextbookStudy.xcodeproj \
+            -scheme ChinaTextbookStudy \
+            -clonedSourcePackagesDirPath SourcePackages
+
+      - name: Build (unsigned)
         working-directory: apps/mobile
         run: |
           set -o pipefail
@@ -30,22 +51,36 @@ jobs:
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
             -derivedDataPath build/DerivedData \
+            -clonedSourcePackagesDirPath SourcePackages \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
             ONLY_ACTIVE_ARCH=NO \
-            build
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build 2>&1 | tee build.log
+
+      - name: Show last part of log (if failed)
+        if: failure()
+        working-directory: apps/mobile
+        run: |
+          echo "===== 最后 150 行日志 ====="
+          tail -n 150 build.log || true
+          echo "===== 查找错误关键字 ====="
+          grep -i -E "error:|fatal|failed|unable|package" build.log | tail -50 || true
 
       - name: Package IPA
         working-directory: apps/mobile
         run: |
           APP_PATH=$(find build/DerivedData -name "ChinaTextbookStudy.app" -type d | head -1)
           if [ -z "$APP_PATH" ]; then
-            echo "找不到 .app"
+            echo "找不到 ChinaTextbookStudy.app，列出所有 .app："
             find build/DerivedData -name "*.app" -type d || true
             exit 1
           fi
-          echo "找到: $APP_PATH"
+          echo "找到 App: $APP_PATH"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -qry ChinaTextbookStudy-unsigned.ipa Payload
@@ -57,3 +92,12 @@ jobs:
           name: ChinaTextbookStudy-unsigned-ipa
           path: apps/mobile/ChinaTextbookStudy-unsigned.ipa
           retention-days: 14
+
+      - name: Upload build log (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: apps/mobile/build.log
+          retention-days: 5
+          if-no-files-found: ignore
