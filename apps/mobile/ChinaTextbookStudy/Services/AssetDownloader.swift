@@ -65,8 +65,8 @@ final class AssetDownloader: ObservableObject {
     private let session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.waitsForConnectivity = true
-        cfg.timeoutIntervalForRequest = 60
-        cfg.timeoutIntervalForResource = 60 * 30
+        cfg.timeoutIntervalForRequest = 120
+        cfg.timeoutIntervalForResource = 60 * 60  // 语文音频可达 60～100MB，给足时间
         return URLSession(configuration: cfg)
     }()
 
@@ -97,13 +97,6 @@ final class AssetDownloader: ObservableObject {
               let m = try? JSONDecoder().decode(IosManifest.self, from: data) else {
             return nil
         }
-        for entry in m.books where hasBookData(entry.bookId) {
-            let marker = audioMarkerURL(entry.bookId)
-            if let old = try? String(contentsOf: marker, encoding: .utf8),
-               old.trimmingCharacters(in: .whitespacesAndNewlines) == entry.audio.sha256 {
-                try? Self.bundleFingerprint(entry).write(to: marker, atomically: true, encoding: .utf8)
-            }
-        }
         self.manifest = m
         audioReadyCache.removeAll()
         return m
@@ -126,7 +119,6 @@ final class AssetDownloader: ObservableObject {
     func hasBookAudio(_ bookId: String) -> Bool {
         if let cached = audioReadyCache[bookId] { return cached }
 
-        // 无音频引用的书（部分数学书）直接视为音频就绪
         if let entry = manifest?.books.first(where: { $0.bookId == bookId }),
            entry.audioRefCount == 0 || entry.audio.bytes <= 0 || entry.audio.sha256.isEmpty {
             audioReadyCache[bookId] = true
@@ -134,12 +126,9 @@ final class AssetDownloader: ObservableObject {
         }
 
         let filesOk = probeBookAudio(bookId)
-        let hasMarker = FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path)
-
-        if hasMarker && !filesOk {
+        if FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path), !filesOk {
             try? FileManager.default.removeItem(at: audioMarkerURL(bookId))
         }
-
         audioReadyCache[bookId] = filesOk
         return filesOk
     }
@@ -221,7 +210,6 @@ final class AssetDownloader: ObservableObject {
         audioReadyCache.removeAll()
 
         do {
-            // 数据包 0 → 0.2
             try await downloadBundle(
                 bundle: entry.data,
                 extractTo: dataRoot,
@@ -231,7 +219,6 @@ final class AssetDownloader: ObservableObject {
             )
             bookProgress[entry.bookId] = 0.2
 
-            // 无音频的书直接跳过音频下载
             let needAudio = entry.audioRefCount > 0
                 && entry.audio.bytes > 0
                 && !entry.audio.sha256.isEmpty
@@ -239,7 +226,7 @@ final class AssetDownloader: ObservableObject {
             if needAudio {
                 try await downloadBundle(
                     bundle: entry.audio,
-                    extractTo: audioRoot.deletingLastPathComponent(),
+                    extractTo: audioRoot.deletingLastPathComponent(), // zip 内已有 audio/ 前缀
                     weight: 0.8,
                     phaseBase: 0.2,
                     bookId: entry.bookId
@@ -291,53 +278,82 @@ final class AssetDownloader: ObservableObject {
 
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         do {
-            try Self.installArchive(tempURL, destination: destination)
+            let written = try Self.installArchive(tempURL, destination: destination)
+            if written == 0 {
+                throw AssetDownloadError.unzipFailed("解压结果为空（路径解析失败）")
+            }
+        } catch let e as AssetDownloadError {
+            throw e
         } catch {
             throw AssetDownloadError.unzipFailed(String(describing: error))
         }
         try? FileManager.default.removeItem(at: tempURL)
     }
 
-    /// 先解压到空临时目录，再逐文件原子写入目标（可覆盖已存在文件）
-    nonisolated static func installArchive(_ archive: URL, destination: URL) throws {
+    /// 解压到临时目录后逐文件写入目标。
+    /// 返回实际写入的文件数。关键：用 resolvingSymlinksInPath 消除 iOS /private 前缀差异。
+    @discardableResult
+    nonisolated static func installArchive(_ archive: URL, destination: URL) throws -> Int {
         let fm = FileManager.default
-        let staging = fm.temporaryDirectory.appendingPathComponent("cstf-install-\(UUID().uuidString)")
+        let staging = fm.temporaryDirectory
+            .appendingPathComponent("cstf-install-\(UUID().uuidString)", isDirectory: true)
         try fm.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: staging) }
 
         try fm.unzipItem(at: archive, to: staging)
 
-        guard let entries = fm.enumerator(
-            at: staging,
-            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        // 统一解析符号链接 /private 前缀，避免相对路径全部算丢
+        let stagingResolved = staging.resolvingSymlinksInPath()
+        let destResolved = destination.resolvingSymlinksInPath()
+
+        guard let enumerator = fm.enumerator(
+            at: stagingResolved,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles]
         ) else {
-            throw AssetDownloadError.unzipFailed("无法读取解压资源")
+            throw AssetDownloadError.unzipFailed("无法枚举解压目录")
         }
 
-        var files: [(URL, URL)] = []
-        let stagingPath = staging.standardizedFileURL.path
-        for case let source as URL in entries {
-            let attributes = try source.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-            if attributes.isSymbolicLink == true {
+        var written = 0
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            if values.isSymbolicLink == true {
                 throw AssetDownloadError.unzipFailed("资源包含符号链接")
             }
-            guard attributes.isRegularFile == true else { continue }
+            guard values.isRegularFile == true else { continue }
 
-            let sourcePath = source.standardizedFileURL.path
-            guard sourcePath.hasPrefix(stagingPath) else { continue }
-            var relative = String(sourcePath.dropFirst(stagingPath.count))
-            if relative.hasPrefix("/") { relative.removeFirst() }
-            guard !relative.isEmpty else { continue }
-            files.append((source, destination.appendingPathComponent(relative)))
-        }
-
-        for (source, target) in files {
-            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try Data(contentsOf: source)
-            if (try? Data(contentsOf: target)) != data {
-                try data.write(to: target, options: .atomic)
+            guard let relative = relativePath(from: stagingResolved, to: fileURL.resolvingSymlinksInPath()) else {
+                continue
             }
+            guard !relative.isEmpty else { continue }
+
+            let target = destResolved.appendingPathComponent(relative)
+            try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            // 覆盖写入（不整文件读进内存比对，大音频包更稳）
+            if fm.fileExists(atPath: target.path) {
+                try fm.removeItem(at: target)
+            }
+            try fm.copyItem(at: fileURL, to: target)
+            written += 1
         }
+
+        if written == 0 {
+            throw AssetDownloadError.unzipFailed("解压后未写入任何文件（路径前缀不匹配）")
+        }
+        return written
+    }
+
+    /// 安全计算相对路径，兼容 /var 与 /private/var
+    nonisolated private static func relativePath(from base: URL, to file: URL) -> String? {
+        let baseComponents = base.pathComponents
+        let fileComponents = file.pathComponents
+        guard fileComponents.count >= baseComponents.count else { return nil }
+        for (i, c) in baseComponents.enumerated() {
+            if fileComponents[i] != c { return nil }
+        }
+        let rel = fileComponents.dropFirst(baseComponents.count)
+        return rel.isEmpty ? nil : rel.joined(separator: "/")
     }
 
     // MARK: - Story images
@@ -401,6 +417,7 @@ private extension URLSession {
                 let dest = FileManager.default.temporaryDirectory
                     .appendingPathComponent("cstf-\(UUID().uuidString).zip")
                 do {
+                    try? FileManager.default.removeItem(at: dest)
                     try FileManager.default.moveItem(at: tmp, to: dest)
                     cont.resume(returning: (dest, resp))
                 } catch {
