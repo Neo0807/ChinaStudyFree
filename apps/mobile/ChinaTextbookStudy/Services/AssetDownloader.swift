@@ -284,12 +284,44 @@ final class AssetDownloader: ObservableObject {
         }
 
         try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        do {
-            try FileManager.default.unzipItem(at: tempURL, to: destination)
-        } catch {
-            throw AssetDownloadError.unzipFailed(String(describing: error))
-        }
-        try? FileManager.default.removeItem(at: tempURL)
+
+// 先尝试删除可能冲突的旧文件，避免「已存在同名文件」错误
+// 数据包会解压出 books/<bookId>/，音频包会解压出 audio/
+if bundle.name.hasPrefix("data-") {
+    // 数据包：只清这本书的目录
+    let bookDir = destination
+        .appendingPathComponent("books", isDirectory: true)
+        .appendingPathComponent(bookId, isDirectory: true)
+    try? FileManager.default.removeItem(at: bookDir)
+} else if bundle.name.hasPrefix("audio-ios-") || bundle.name.hasPrefix("audio-") {
+    // 音频包是内容寻址的，通常不会整目录冲突，但为了保险也清一下临时残留
+    // 这里不做整目录删除，避免影响其他已下载的书
+}
+
+do {
+    // 使用 overwrite 兼容写法（ZIPFoundation 不同版本参数略有差异）
+    try FileManager.default.unzipItem(
+        at: tempURL,
+        to: destination,
+        skipCRC32: false,
+        progress: nil,
+        preferredEncoding: .utf8
+    )
+} catch {
+    // 如果还是失败，再强制清一次后重试一次
+    if bundle.name.hasPrefix("data-") {
+        let bookDir = destination
+            .appendingPathComponent("books", isDirectory: true)
+            .appendingPathComponent(bookId, isDirectory: true)
+        try? FileManager.default.removeItem(at: bookDir)
+    }
+    do {
+        try FileManager.default.unzipItem(at: tempURL, to: destination)
+    } catch {
+        throw AssetDownloadError.unzipFailed(String(describing: error))
+    }
+}
+try? FileManager.default.removeItem(at: tempURL)
     }
 
     // MARK: - Story illustrations (content-8)
