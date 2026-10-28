@@ -42,8 +42,16 @@ struct BookDownloadCard: View {
 
             Button(inFlight ? "下载中…" : (downloader.lastError != nil ? "重试下载" : "下载课本")) {
                 Task {
-                    try? await downloader.ensureBookDownloaded(entry)
-                    if downloader.isBookDownloaded(entry.bookId) { onComplete() }
+                    do {
+                        try await downloader.ensureBookDownloaded(entry)
+                    } catch {
+                        // 错误详情已由 AssetDownloader 记录在 lastError，卡片会内联展示。
+                    }
+                    // 完成回调只以「数据 + 音频都真的就绪」为准，不看进度条。
+                    if downloader.isBookDownloaded(entry.bookId) {
+                        HapticEngine.shared.success()
+                        onComplete()
+                    }
                 }
             }
             .buttonStyle(ChunkyButtonStyle(inFlight ? .disabled : .secondary))
@@ -52,8 +60,5 @@ struct BookDownloadCard: View {
         .padding(16)
         .background(DuoColors.surface, in: .rect(cornerRadius: Radius.card))
         .overlay { RoundedRectangle(cornerRadius: Radius.card).strokeBorder(DuoColors.border, lineWidth: 2) }
-        .onChange(of: progress) { _, p in
-            if p >= 1 { HapticEngine.shared.success(); onComplete() }
-        }
     }
 }
