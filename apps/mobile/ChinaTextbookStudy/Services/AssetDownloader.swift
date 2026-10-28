@@ -73,6 +73,14 @@ final class AssetDownloader: ObservableObject {
     private var dataRoot: URL { DataLoader.shared.sandboxDataRoot }
     private var audioRoot: URL { DataLoader.shared.sandboxAudioRoot }
     private var audioReadyCache: [String: Bool] = [:]
+    /// 每本书正在跑的下载任务。重复触发时 await 已有任务，避免「提前返回被当成已完成」。
+    private var inFlightTasks: [String: Task<Void, Error>] = [:]
+
+    /// manifest 是否声明这本书带音频。三处判断（下载、状态、探测）共用同一套规则，
+    /// 避免"引用为空"被当成"音频已就绪"。
+    nonisolated static func requiresAudio(_ entry: ManifestEntry) -> Bool {
+        entry.audioRefCount > 0 && entry.audio.bytes > 0 && !entry.audio.sha256.isEmpty
+    }
 
     // MARK: - Manifest
 
@@ -119,18 +127,26 @@ final class AssetDownloader: ObservableObject {
     func hasBookAudio(_ bookId: String) -> Bool {
         if let cached = audioReadyCache[bookId] { return cached }
 
-        if let entry = manifest?.books.first(where: { $0.bookId == bookId }),
-           entry.audioRefCount == 0 || entry.audio.bytes <= 0 || entry.audio.sha256.isEmpty {
-            audioReadyCache[bookId] = true
-            return true
+        let entry = manifest?.books.first(where: { $0.bookId == bookId })
+        let ready: Bool
+        if let entry, !Self.requiresAudio(entry) {
+            // manifest 明确声明这本书没有音频：不要求音频文件，但数据必须已经落地，
+            // 否则会把「还没下载」误判成「音频已就绪」。
+            ready = hasBookData(bookId)
+        } else if let entry {
+            // 声明有音频：以「按当前 manifest 完成过一次校验的下载」为准。
+            // 只看引用是否为空并不可靠 —— 引用为空常常只是数据还没解压完。
+            ready = markerMatchesManifest(entry) || probeBookAudio(bookId, entry: entry)
+        } else {
+            // manifest 还没加载：只能探测磁盘上实际存在的文件。
+            ready = probeBookAudio(bookId, entry: nil)
         }
 
-        let filesOk = probeBookAudio(bookId)
-        if FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path), !filesOk {
+        if !ready, FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path) {
             try? FileManager.default.removeItem(at: audioMarkerURL(bookId))
         }
-        audioReadyCache[bookId] = filesOk
-        return filesOk
+        audioReadyCache[bookId] = ready
+        return ready
     }
 
     private var audioMarkerDir: URL {
@@ -150,17 +166,36 @@ final class AssetDownloader: ObservableObject {
         try? Self.bundleFingerprint(entry).write(to: audioMarkerURL(entry.bookId), atomically: true, encoding: .utf8)
     }
 
-    private func probeBookAudio(_ bookId: String) -> Bool {
+    /// 标记文件里的指纹与当前 manifest 一致，说明这本书的资源已经按这一版
+    /// 校验并安装过；manifest 换版（重新打包资源）后会自动失效并要求重下。
+    private func markerMatchesManifest(_ entry: ManifestEntry) -> Bool {
+        guard let stamped = try? String(contentsOf: audioMarkerURL(entry.bookId), encoding: .utf8) else {
+            return false
+        }
+        return stamped.trimmingCharacters(in: .whitespacesAndNewlines) == Self.bundleFingerprint(entry)
+    }
+
+    /// 抽查若干音频引用是否真的能解析到文件。
+    /// - Parameter entry: 当前 manifest 条目，nil 表示 manifest 未知。
+    private func probeBookAudio(_ bookId: String, entry: ManifestEntry?) -> Bool {
         let refs = sampleAudioRefs(bookId, limit: 8)
-        guard !refs.isEmpty else { return true }
+        guard !refs.isEmpty else {
+            // 抽样不到任何音频引用时不能直接判定「音频已就绪」：
+            // 只有 manifest 明确声明这本书没有音频才算；数据没解压完、
+            // 引用字段为空等情况都必须返回未就绪。
+            if let entry { return !Self.requiresAudio(entry) }
+            return FileManager.default.fileExists(atPath: audioMarkerURL(bookId).path)
+        }
         return refs.allSatisfy { AudioPlayer.shared.resolve($0) != nil }
     }
 
     private func sampleAudioRefs(_ bookId: String, limit: Int) -> [String] {
         var refs: [String] = []
         func collect(_ path: String?) {
-            guard refs.count < limit, let path, !path.isEmpty else { return }
-            refs.append(path)
+            guard refs.count < limit, let path else { return }
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            refs.append(trimmed)
         }
         if let passages = (try? DataLoader.shared.loadPassages(bookId: bookId))?.passages {
             outer: for p in passages {
@@ -201,10 +236,27 @@ final class AssetDownloader: ObservableObject {
 
     // MARK: - Download
 
+    /// 下载并安装一本书的资源。
+    ///
+    /// 同一本书重复触发时**不会**提前返回：调用方会等到正在跑的那次任务结束，
+    /// 因此「await 返回」就等于「下载真的结束了」，不会被误认为下载完成。
     func ensureBookDownloaded(_ entry: ManifestEntry) async throws {
-        if inFlight.contains(entry.bookId) { return }
+        if let running = inFlightTasks[entry.bookId] {
+            try await running.value
+            return
+        }
+
+        let task = Task { try await self.performDownload(entry) }
+        inFlightTasks[entry.bookId] = task
         inFlight.insert(entry.bookId)
-        defer { inFlight.remove(entry.bookId) }
+        defer {
+            inFlight.remove(entry.bookId)
+            inFlightTasks[entry.bookId] = nil
+        }
+        try await task.value
+    }
+
+    private func performDownload(_ entry: ManifestEntry) async throws {
         bookProgress[entry.bookId] = 0
         lastError = nil
         audioReadyCache.removeAll()
@@ -219,11 +271,7 @@ final class AssetDownloader: ObservableObject {
             )
             bookProgress[entry.bookId] = 0.2
 
-            let needAudio = entry.audioRefCount > 0
-                && entry.audio.bytes > 0
-                && !entry.audio.sha256.isEmpty
-
-            if needAudio {
+            if Self.requiresAudio(entry) {
                 try await downloadBundle(
                     bundle: entry.audio,
                     extractTo: audioRoot.deletingLastPathComponent(), // zip 内已有 audio/ 前缀
@@ -232,18 +280,24 @@ final class AssetDownloader: ObservableObject {
                     bookId: entry.bookId
                 )
                 audioReadyCache.removeAll()
-                if !probeBookAudio(entry.bookId) {
+                if !probeBookAudio(entry.bookId, entry: entry) {
                     throw AssetDownloadError.audioNotReady
                 }
             }
 
             writeAudioMarker(entry)
             audioReadyCache.removeAll()
+            // 进度推到 100% 之前，必须确认数据和音频都已落地并通过探测。
+            guard hasBookData(entry.bookId), hasBookAudio(entry.bookId) else {
+                throw AssetDownloadError.audioNotReady
+            }
             bookProgress[entry.bookId] = 1
             try? markExcludedFromBackup(dataRoot)
             try? markExcludedFromBackup(audioRoot)
         } catch {
             audioReadyCache.removeAll()
+            // 失败时把进度退回 0，避免卡片停在 98% 让用户以为快好了却无法重试。
+            bookProgress[entry.bookId] = 0
             lastError = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
             throw error
         }
@@ -263,7 +317,10 @@ final class AssetDownloader: ObservableObject {
             let total = expected > 0 ? Double(expected) : Double(bundle.bytes)
             let frac = total > 0 ? min(1.0, Double(received) / total) : 0
             Task { @MainActor in
-                self.bookProgress[bookId] = phaseBase + frac * weight
+                // 传输完成 ≠ 安装完成：进度封顶 0.98，把最后一点留给
+                // sha256 校验、解压和资源探测。100% 只由 performDownload 在
+                // 全部验证通过后写入，避免「字节下完就报完成」。
+                self.bookProgress[bookId] = min(0.98, phaseBase + frac * weight)
             }
         }
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
